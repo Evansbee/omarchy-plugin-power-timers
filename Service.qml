@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import "Model.js" as Model
 
@@ -47,6 +48,11 @@ Item {
   property bool stayAwake: false
   property bool screenIsOff: false
 
+  // Addresses of live screensaver windows, so the close of the last one is
+  // what counts rather than any one of them.
+  property var screensaverWindows: ({})
+  property int screensaverCount: 0
+
   // What the first-party service last told us.
   property bool builtinIdle: false
   property bool builtinRawIdle: false
@@ -61,6 +67,7 @@ Item {
   property double idleStart: 0
   property bool suspendFired: false
 
+  readonly property bool lockOnWake: Model.isOn(timers.lockOnWake)
   readonly property int screenOffSeconds: Model.seconds(timers.screenOff)
   readonly property int suspendSeconds: Model.seconds(timers.suspend)
 
@@ -106,6 +113,66 @@ Item {
     root.screenIsOff = false
     log("screen-on", reason)
     run(screenOnProcess, Model.dpmsCommand(true))
+  }
+
+  // ---- Lock when you return.
+  //
+  // Omarchy locks on a timer, so coming back after the deadline means the lock
+  // surface has already replaced the screensaver and that is all you ever see.
+  // Lock-on-wake removes the timed lock (idle.lock is written as never) and
+  // fires the lock off the dismissal instead: the screensaver stays up for as
+  // long as you are away, and touching it asks for the password.
+  //
+  // The cost is a gap. The screensaver window has to close before this can
+  // know to lock, so the desktop is briefly visible underneath — a tenth of a
+  // second or so, since omarchy-system-lock is an IPC into this same shell and
+  // the locker is keepLoaded. It is not an atomic lock, and anyone standing at
+  // the keyboard would see that flash.
+  function setScreensaverWindow(address, present) {
+    var key = String(address || "")
+    if (!key) return
+    var next = {}
+    var count = 0
+    for (var existing in root.screensaverWindows) {
+      if (existing !== key && root.screensaverWindows[existing]) { next[existing] = true; count++ }
+    }
+    if (present) { next[key] = true; count++ }
+    root.screensaverWindows = next
+    root.screensaverCount = count
+  }
+
+  function handleScreensaverClosed() {
+    if (!root.lockOnWake) return
+    if (root.screensaverCount > 0) return
+    if (root.stayAwake) return
+    log("lock-on-wake", "screensaver dismissed after " + root.idleSeconds + "s idle")
+    // The screensaver going away is the user arriving, so the clock stops here
+    // too; the lock itself keeps the session shut until they authenticate.
+    run(lockProcess, Model.lockCommand())
+  }
+
+  function handleHyprlandEvent(event) {
+    var name = String(event && event.name ? event.name : "")
+    if (name !== "openwindow" && name !== "closewindow") return
+    var parts = []
+    try {
+      parts = event.parse(name === "openwindow" ? 4 : 1)
+    } catch (e) {
+      parts = String(event.data || "").split(",")
+    }
+    var address = String(parts[0] || "")
+    if (name === "openwindow") {
+      if (String(parts[2] || "") === Model.SCREENSAVER_CLASS) root.setScreensaverWindow(address, true)
+      return
+    }
+    if (!root.screensaverWindows[address]) return
+    root.setScreensaverWindow(address, false)
+    root.handleScreensaverClosed()
+  }
+
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) { root.handleHyprlandEvent(event) }
   }
 
   function suspendSystem() {
@@ -207,6 +274,7 @@ Item {
     onTriggered: if (idleProbe.running) idleProbe.running = false
   }
 
+  Process { id: lockProcess }
   Process { id: screenOffProcess }
   Process { id: screenOnProcess }
   Process { id: suspendProcess }
@@ -272,6 +340,9 @@ Item {
         threshold: root.builtinThreshold
       },
       idleSeconds: root.idleSeconds,
+      lockOnWake: root.lockOnWake,
+      lockOnWakeUnusable: Model.lockOnWakeUnusable(root.timers),
+      screensaverWindows: root.screensaverCount,
       screenIsOff: root.screenIsOff,
       suspendFired: root.suspendFired,
       pollInterval: root.pollInterval,

@@ -117,6 +117,40 @@ take effect immediately and need none of this.
 - Stage timing is accurate to the poll interval — 5s once idle, 15s before.
   On an hours-long stage that is noise.
 
+## Lock when you come back
+
+Omarchy locks on a timer. Set the screensaver to 10 minutes and the lock to 30
+and you get the screensaver for twenty minutes, then a session-lock surface
+that covers it — so coming back any later than half an hour, the screensaver is
+all you never saw.
+
+`Lock when I come back` swaps the timer for the event. Omarchy's lock timeout
+is written as never, and the lock fires off the screensaver being *dismissed*
+instead:
+
+```
+ 10m  screensaver appears
+   …  stays up, however long you are gone
+   ↓  you touch the mouse
+      screensaver closes → lock
+```
+
+The screensaver is an ordinary window (class `org.omarchy.screensaver`) and
+Hyprland emits `closewindow` for it the instant it goes. The first-party
+service already watches that exact event — it just reads it the other way
+round, as "the user came back, cancel the pending lock". This is the same
+event, inverted.
+
+**The tradeoff, stated plainly:** this is not an atomic lock. The screensaver
+window has to close before anything can know to lock it, so the desktop is
+briefly visible underneath — on the order of a tenth of a second, since
+`omarchy-system-lock` is an IPC into the same shell and the locker is
+`keepLoaded`. Someone standing at the keyboard would see that flash. If your
+threat model cares, use the timed lock instead.
+
+It needs a screensaver to hang off: with the screensaver set to Never there is
+no window to dismiss, and the panel says so rather than pretending.
+
 ## Where the settings live
 
 Two of the four keys are Omarchy's and two are this plugin's, and they mean
@@ -135,6 +169,10 @@ opposite things at zero — which is exactly why they do not share an object.
 | `idle.lock` | Omarchy (`omarchy.idle`) | seconds | **immediately** |
 | `evansbee.power-timers.screenOff` | this plugin | seconds | never |
 | `evansbee.power-timers.suspend` | this plugin | seconds | never |
+| `evansbee.power-timers.lockOnWake` | this plugin | 0 / 1 | off |
+
+With `lockOnWake` on, `idle.lock` is written as `86400` — the timed lock is
+deliberately out of the way, and the lock comes from the screensaver closing.
 
 Because 0 cannot mean "never" for Omarchy's two keys, picking **Never** for the
 screensaver or the lock writes `86400` — a day, which is never inside any

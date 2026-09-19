@@ -22,13 +22,13 @@ var OMARCHY_KEYS = ["screensaver", "lock"]
 // Keys owned by this plugin. They live under their own top-level object rather
 // than in `idle` precisely because 0 means the opposite there: for Omarchy's
 // keys 0 is immediate, for these it is never.
-var PLUGIN_KEYS = ["screenOff", "suspend"]
+var PLUGIN_KEYS = ["screenOff", "suspend", "lockOnWake"]
 var PLUGIN_CONFIG_KEY = "evansbee.power-timers"
 
 function defaultTimers() {
   // Screensaver and lock mirror Omarchy's own defaults; screen off and suspend
   // default to never, which is what Omarchy does today with no plugin at all.
-  return { screensaver: 150, lock: 300, screenOff: 0, suspend: 0 }
+  return { screensaver: 150, lock: 300, screenOff: 0, suspend: 0, lockOnWake: 0 }
 }
 
 function seconds(value) {
@@ -87,8 +87,9 @@ function summary(timers) {
   var parts = []
   parts.push(isNever(timers.screensaver)
     ? "no screensaver" : "screensaver " + formatDuration(timers.screensaver))
-  parts.push(isNever(timers.lock)
-    ? "never locks" : "lock " + formatDuration(timers.lock))
+  parts.push(isOn(timers.lockOnWake)
+    ? "locks when you return"
+    : (isNever(timers.lock) ? "never locks" : "lock " + formatDuration(timers.lock)))
   parts.push(isNever(timers.screenOff)
     ? "screen stays on" : "screen off " + formatDuration(timers.screenOff))
   parts.push(isNever(timers.suspend)
@@ -100,7 +101,9 @@ function summary(timers) {
 // simply happens first. That is legal and occasionally deliberate — worth a
 // note under the rows, not a correction the panel makes on the user's behalf.
 function outOfOrder(timers) {
-  var order = ["screensaver", "lock", "screenOff", "suspend"]
+  var order = isOn(timers.lockOnWake)
+    ? ["screensaver", "screenOff", "suspend"]
+    : ["screensaver", "lock", "screenOff", "suspend"]
   var previous = 0
   for (var i = 0; i < order.length; i++) {
     var value = timers[order[i]]
@@ -133,18 +136,25 @@ function readTimers(raw) {
 
   var mine = data[PLUGIN_CONFIG_KEY] && typeof data[PLUGIN_CONFIG_KEY] === "object"
     ? data[PLUGIN_CONFIG_KEY] : {}
-  for (var j = 0; j < PLUGIN_KEYS.length; j++) {
-    var pluginKey = PLUGIN_KEYS[j]
+  var durationKeys = ["screenOff", "suspend"]
+  for (var j = 0; j < durationKeys.length; j++) {
+    var pluginKey = durationKeys[j]
     if (mine[pluginKey] !== undefined && mine[pluginKey] !== null)
       timers[pluginKey] = seconds(mine[pluginKey])
   }
+  timers.lockOnWake = isOn(mine.lockOnWake) ? 1 : 0
 
   return timers
 }
 
+function isOn(value) {
+  return value === true || Number(value) === 1
+}
+
 function sameTimers(a, b) {
   if (!a || !b) return false
-  var keys = OMARCHY_KEYS.concat(PLUGIN_KEYS)
+  if (isOn(a.lockOnWake) !== isOn(b.lockOnWake)) return false
+  var keys = OMARCHY_KEYS.concat(["screenOff", "suspend"])
   for (var i = 0; i < keys.length; i++) {
     if (seconds(a[keys[i]]) !== seconds(b[keys[i]])) return false
   }
@@ -165,18 +175,25 @@ function writeCommand(timers) {
   var lock = writableOmarchySeconds(timers.lock)
   var screenOff = seconds(timers.screenOff)
   var suspend = seconds(timers.suspend)
+  var lockOnWake = isOn(timers.lockOnWake)
+
+  // Lock-on-wake means no timed lock at all: the screensaver stays up until
+  // it is touched, and the lock fires then. Omarchy's own lock timer has to be
+  // out of the way for that, so it is written as never.
+  if (lockOnWake) lock = NEVER_SECONDS
 
   var program = ''
     + '\n| .idle = (.idle | if type == "object" then . else {} end)'
     + '\n| .idle.screensaver = $screensaver'
     + '\n| .idle.lock = $lock'
-    + '\n| ."' + PLUGIN_CONFIG_KEY + '" = { screenOff: $screenOff, suspend: $suspend }\n'
+    + '\n| ."' + PLUGIN_CONFIG_KEY + '" = { screenOff: $screenOff, suspend: $suspend, lockOnWake: $lockOnWake }\n'
 
   return 'source omarchy-shell-config && commit "$NORMALIZE"' + singleQuote(program)
     + ' --argjson screensaver ' + screensaver
     + ' --argjson lock ' + lock
     + ' --argjson screenOff ' + screenOff
     + ' --argjson suspend ' + suspend
+    + ' --argjson lockOnWake ' + (lockOnWake ? 1 : 0)
 }
 
 // Never, for a key Omarchy owns, has to be a real number of seconds.
@@ -355,4 +372,23 @@ function firstStage(screenOffSeconds, suspendSeconds) {
 function stageDelay(stageSeconds, firstStageSeconds) {
   if (stageSeconds <= 0) return -1
   return Math.max(0, stageSeconds - firstStageSeconds)
+}
+
+// ------------------------------------------------------- lock when you return
+
+// The screensaver is an ordinary window (class org.omarchy.screensaver) and
+// Hyprland emits closewindow for it the moment it is dismissed. The
+// first-party service already watches that event and treats it as "the user
+// came back, cancel the pending lock". Lock-on-wake is the same event read the
+// other way round: the user came back, so ask for the password.
+var SCREENSAVER_CLASS = "org.omarchy.screensaver"
+
+function lockCommand() {
+  return "omarchy-system-lock"
+}
+
+// Lock-on-wake has nothing to hang off if no screensaver ever appears, since
+// the dismissal of that window is the whole signal.
+function lockOnWakeUnusable(timers) {
+  return isOn(timers.lockOnWake) && isNever(timers.screensaver)
 }

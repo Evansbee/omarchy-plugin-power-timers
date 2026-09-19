@@ -47,7 +47,8 @@ Panel {
 
   // Row index 4 is the Stay Awake switch, which sits below the ladder because
   // it governs all of it.
-  readonly property int stayAwakeIndex: stageRows.length
+  readonly property int lockOnWakeIndex: stageRows.length
+  readonly property int stayAwakeIndex: stageRows.length + 1
   property int selectedIndex: 0
   property bool cursorActive: false
 
@@ -60,6 +61,18 @@ Panel {
     : (hostWidget ? hostWidget.timers : Model.defaultTimers())
 
   readonly property bool orderMixed: Model.outOfOrder(timers)
+  readonly property bool lockOnWake: Model.isOn(timers.lockOnWake)
+  readonly property bool lockOnWakeUnusable: Model.lockOnWakeUnusable(timers)
+
+  function toggleLockOnWake() {
+    var base = timers
+    var next = {}
+    for (var k in base) next[k] = base[k]
+    next.lockOnWake = root.lockOnWake ? 0 : 1
+    root.draft = next
+    writeDebounce.restart()
+    settleTimer.stop()
+  }
 
   function valueFor(key) { return Model.seconds(timers[key]) }
   function labelFor(key) { return Model.formatDuration(timers[key]) }
@@ -87,11 +100,15 @@ Panel {
   }
 
   function adjustCursor(delta) {
+    if (selectedIndex === lockOnWakeIndex) { toggleLockOnWake(); return }
     if (selectedIndex === stayAwakeIndex) return
-    adjust(stageRows[selectedIndex].key, delta)
+    var key = stageRows[selectedIndex].key
+    if (key === "lock" && root.lockOnWake) return
+    adjust(key, delta)
   }
 
   function activateCursor() {
+    if (selectedIndex === lockOnWakeIndex) { toggleLockOnWake(); return }
     if (selectedIndex !== stayAwakeIndex) return
     if (hostWidget) hostWidget.toggleStayAwake()
   }
@@ -305,7 +322,8 @@ Panel {
 
                     PanelActionButton {
                       iconText: "−"
-                      enabled: !root.stayAwake && root.canStep(stageRow.stageKey, -1)
+                      enabled: !root.stayAwake && !(stageRow.stageKey === "lock" && root.lockOnWake)
+                        && root.canStep(stageRow.stageKey, -1)
                       foreground: root.contentForeground
                       hoverColor: root.contentForeground
                       fontFamily: root.contentFontFamily
@@ -327,7 +345,8 @@ Panel {
                       anchors.verticalCenter: parent.verticalCenter
                       width: Style.space(62)
                       horizontalAlignment: Text.AlignHCenter
-                      text: root.labelFor(stageRow.stageKey)
+                      text: stageRow.stageKey === "lock" && root.lockOnWake
+                        ? "on wake" : root.labelFor(stageRow.stageKey)
                       color: stageRow.never ? root.dimForeground : root.contentForeground
                       font.family: root.contentFontFamily
                       font.pixelSize: Style.font.body
@@ -336,7 +355,8 @@ Panel {
 
                     PanelActionButton {
                       iconText: "+"
-                      enabled: !root.stayAwake && root.canStep(stageRow.stageKey, 1)
+                      enabled: !root.stayAwake && !(stageRow.stageKey === "lock" && root.lockOnWake)
+                        && root.canStep(stageRow.stageKey, 1)
                       foreground: root.contentForeground
                       hoverColor: root.contentForeground
                       fontFamily: root.contentFontFamily
@@ -357,7 +377,9 @@ Panel {
                   width: parent.width
                   leftPadding: Style.space(22) + Style.spacing.md
                   elide: Text.ElideRight
-                  text: stageRow.never ? "never happens" : stageRow.modelData.hint
+                  text: stageRow.stageKey === "lock" && root.lockOnWake
+                    ? "asks for your password when you come back"
+                    : (stageRow.never ? "never happens" : stageRow.modelData.hint)
                   color: root.dimForeground
                   font.family: root.contentFontFamily
                   font.pixelSize: Style.font.caption
@@ -380,6 +402,95 @@ Panel {
             color: root.urgentColor
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
+          }
+
+          PanelSeparator { foreground: root.contentForeground }
+
+          // ---- Lock when you return. Omarchy locks on a timer, which means
+          //      coming back late shows the lock screen and never the
+          //      screensaver. This swaps the timer for the dismissal.
+          CursorSurface {
+            id: wakeRow
+            width: content.width
+            height: wakeBody.implicitHeight + Style.spacing.md * 2
+            foreground: root.contentForeground
+            accent: root.accentColor
+            hasCursor: root.cursorActive && root.selectedIndex === root.lockOnWakeIndex
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onEntered: {
+                root.cursorActive = true
+                root.selectedIndex = root.lockOnWakeIndex
+              }
+              onExited: if (root.selectedIndex === root.lockOnWakeIndex) root.cursorActive = false
+              onClicked: root.toggleLockOnWake()
+            }
+
+            Item {
+              id: wakeBody
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.spacing.rowPaddingX
+              anchors.rightMargin: Style.spacing.rowPaddingX
+              implicitHeight: Math.max(wakeSwitch.height, wakeText.implicitHeight)
+
+              Text {
+                id: wakeIcon
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(22)
+                text: "󰌾"
+                color: root.lockOnWake ? root.contentForeground : root.dimForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.icon
+              }
+
+              Column {
+                id: wakeText
+                anchors.left: wakeIcon.right
+                anchors.leftMargin: Style.spacing.md
+                anchors.right: wakeSwitch.left
+                anchors.rightMargin: Style.spacing.lg
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.spacing.xxs
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "Lock when I come back"
+                  color: root.contentForeground
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  text: root.lockOnWakeUnusable
+                    ? "needs a screensaver — set one above"
+                    : "screensaver stays up until you touch it, then asks for the password"
+                  color: root.lockOnWakeUnusable ? root.urgentColor : root.dimForeground
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              ToggleSwitch {
+                id: wakeSwitch
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.lockOnWake
+                foreground: root.contentForeground
+                accent: root.accentColor
+                hasCursor: root.cursorActive && root.selectedIndex === root.lockOnWakeIndex
+                onToggled: root.toggleLockOnWake()
+              }
+            }
           }
 
           PanelSeparator { foreground: root.contentForeground }
