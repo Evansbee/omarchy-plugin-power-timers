@@ -96,10 +96,22 @@ Panel {
     if (hostWidget) hostWidget.toggleStayAwake()
   }
 
+  readonly property bool restartPending: hostWidget ? hostWidget.restartPending === true : false
+
   onOpenedChanged: {
-    if (!opened) return
-    root.cursorActive = false
-    root.selectedIndex = 0
+    if (opened) {
+      root.cursorActive = false
+      root.selectedIndex = 0
+      return
+    }
+    // Closing is the commit point for anything still in flight: flush the
+    // debounce, then let the widget restart the shell if Omarchy's own two
+    // timeouts changed and need re-registering.
+    var pending = root.draft
+    writeDebounce.stop()
+    if (!root.hostWidget) return
+    if (pending) root.hostWidget.writeTimers(pending)
+    root.hostWidget.applyPending(pending)
   }
 
   Timer {
@@ -463,7 +475,9 @@ Panel {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
-            text: "j/k move · h/l adjust · saved automatically\nright-click the bar icon to toggle stay awake"
+            text: root.restartPending
+              ? "j/k move · h/l adjust · saved automatically\nscreensaver and lock apply when you close this panel"
+              : "j/k move · h/l adjust · saved automatically\nright-click the bar icon to toggle stay awake"
             color: Qt.darker(root.contentForeground, 1.6)
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption

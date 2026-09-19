@@ -1,7 +1,6 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
-import Quickshell.Wayland
 import "Model.js" as Model
 
 // The two idle stages Omarchy does not ship: turning the screen off, and
@@ -13,38 +12,70 @@ import "Model.js" as Model
 // mounts one widget instance per monitor and a suspend timer must exist once
 // per session, not once per screen.
 //
-// Structure mirrors omarchy.idle deliberately: ONE IdleMonitor armed at the
-// earliest stage, then plain timers for whatever comes after it. A timer
-// cannot be reset by the flicker of activity the compositor reports when a
-// screensaver or lock surface appears, which a second IdleMonitor would be.
+// ---------------------------------------------------------------------------
+// Why there is no IdleMonitor here
+//
+// The obvious implementation is a second IdleMonitor armed at this plugin's
+// earliest stage. It does not work, and it fails silently and dangerously.
+//
+// Two IdleMonitors in one shell share a single ext-idle-notify registration.
+// The first one to register sets the timeout and the second is ignored, so a
+// monitor asking for two hours alongside Omarchy's ten minutes pins the whole
+// shell to one of them. Measured on Hyprland 0.56 / Quickshell: with this
+// plugin's own monitor at 7200s, the first-party service never reported idle
+// at all — no screensaver, and no auto-lock. Two monitors at the *same*
+// timeout coexist fine, which is what makes the failure so easy to miss.
+//
+// So this service creates no monitor. It asks the first-party service what it
+// already knows, over the same IPC a person would use, and times its own two
+// stages from that. Polling a socket every few seconds is a very cheap price
+// for not being able to break the lock screen.
+// ---------------------------------------------------------------------------
 Item {
   id: root
 
   // Injected by omarchy-shell's service loader.
   property var shell: null
   property var manifest: null
+  property string omarchyPath: "/usr/share/omarchy"
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string configPath: home + "/.config/omarchy/shell.json"
   readonly property string stayAwakeDir: home + "/.local/state/omarchy/indicators"
-  readonly property string stayAwakePath: stayAwakeDir + "/stay-awake"
 
   property var timers: Model.defaultTimers()
   property bool stayAwake: false
   property bool screenIsOff: false
-  property bool inCycle: false
+
+  // What the first-party service last told us.
+  property bool builtinIdle: false
+  property bool builtinRawIdle: false
+  property bool builtinInCycle: false
+  property int builtinThreshold: 0
+  property bool builtinReachable: false
+
+  // Epoch ms when the seat went quiet, inferred from the first-party threshold.
+  // Zero means "not idle".
+  property double idleStart: 0
+  property bool suspendFired: false
 
   readonly property int screenOffSeconds: Model.seconds(timers.screenOff)
   readonly property int suspendSeconds: Model.seconds(timers.suspend)
-  readonly property int firstStageSeconds: Model.firstStage(screenOffSeconds, suspendSeconds)
 
   // Stay Awake is Omarchy's master switch for idling, so it has to govern
   // these stages too. Without this, "Stay Awake" would hold off the
   // screensaver and then suspend the machine anyway.
-  readonly property bool armed: !stayAwake && firstStageSeconds > 0
+  readonly property bool armed: !stayAwake && (screenOffSeconds > 0 || suspendSeconds > 0)
 
-  readonly property int screenOffDelay: Model.stageDelay(screenOffSeconds, firstStageSeconds)
-  readonly property int suspendDelay: Model.stageDelay(suspendSeconds, firstStageSeconds)
+  // Recomputed on every poll, never bound. A binding containing Date.now() has
+  // no reactive dependency on the clock, so it freezes at whatever it was when
+  // idleStart changed — which silently pinned this at the threshold value and
+  // meant no stage after it was ever due.
+  property int idleSeconds: 0
+
+  // Stages earlier than the first-party threshold cannot fire on time, because
+  // nothing reports idle before then.
+  readonly property var lateStages: Model.stagesBelowThreshold(timers, builtinThreshold)
 
   function log(event, detail) {
     var suffix = detail === undefined || detail === "" ? "" : ": " + String(detail)
@@ -59,15 +90,15 @@ Item {
   function turnScreenOff() {
     if (root.screenIsOff) return
     root.screenIsOff = true
-    log("screen-off", "after " + root.screenOffSeconds + "s idle")
+    log("screen-off", "idle " + root.idleSeconds + "s of " + root.screenOffSeconds + "s")
     run(screenOffProcess, Model.dpmsCommand(false))
   }
 
   // Hyprland wakes the display on key press and mouse move on its own, so this
-  // is the belt to that suspenders: it covers a cancel that came from
-  // somewhere other than the pointer, and it is harmless when the screen is
-  // already on. A separate Process from the one above so a still-running
-  // "off" can never swallow the "on" and leave the screen dark.
+  // is the belt to that suspenders: it covers a wake that came from somewhere
+  // other than the pointer, and it is harmless when the screen is already on.
+  // A separate Process from the one above so a still-running "off" can never
+  // swallow the "on" and leave the screen dark.
   function turnScreenOn(reason) {
     if (!root.screenIsOff) return
     root.screenIsOff = false
@@ -76,59 +107,95 @@ Item {
   }
 
   function suspendSystem() {
-    log("suspend", "after " + root.suspendSeconds + "s idle")
+    if (root.suspendFired) return
+    root.suspendFired = true
+    log("suspend", "idle " + root.idleSeconds + "s of " + root.suspendSeconds + "s")
     run(suspendProcess, Model.suspendCommand())
   }
 
-  function startCycle() {
-    if (root.inCycle) return
-    root.inCycle = true
-    log("cycle-start", "screenOff=" + root.screenOffSeconds + " suspend=" + root.suspendSeconds)
-
-    if (root.screenOffDelay === 0) turnScreenOff()
-    else if (root.screenOffDelay > 0) screenOffTimer.restart()
-
-    if (root.suspendDelay === 0) suspendSystem()
-    else if (root.suspendDelay > 0) suspendTimer.restart()
-  }
-
-  function cancelCycle(reason) {
-    screenOffTimer.stop()
-    suspendTimer.stop()
+  function endIdle(reason) {
+    if (root.idleStart === 0 && !root.screenIsOff) return
+    root.idleStart = 0
+    root.idleSeconds = 0
+    root.suspendFired = false
     turnScreenOn(reason || "activity")
-    if (!root.inCycle) return
-    root.inCycle = false
-    log("cycle-cancel", reason || "activity")
+    log("idle-end", reason || "activity")
   }
 
-  onArmedChanged: if (!armed) cancelCycle("disarmed")
+  function applyIdleStatus(raw) {
+    var status = Model.parseIdleStatus(raw)
+    root.builtinReachable = status.ok
+    if (!status.ok) return
 
-  IdleMonitor {
-    id: idleMonitor
-    enabled: root.armed
-    timeout: root.firstStageSeconds
-    // A fullscreen video or anything else holding an idle inhibitor keeps the
-    // screen on and the machine awake, same as the first-party service.
-    respectInhibitors: true
-    onIsIdleChanged: {
-      if (!root.armed) return
-      if (isIdle) root.startCycle()
-      else root.cancelCycle("activity")
+    root.builtinIdle = status.idle
+    root.builtinRawIdle = status.rawIdle
+    root.builtinInCycle = status.inCycle
+    root.builtinThreshold = status.threshold
+
+    if (!status.idle) {
+      endIdle("activity")
+      return
+    }
+
+    if (root.idleStart === 0) {
+      root.idleStart = Model.idleStartFrom(Date.now(), status.threshold)
+      log("idle-start", "threshold " + status.threshold + "s"
+        + " screenOff=" + root.screenOffSeconds + " suspend=" + root.suspendSeconds)
+    }
+
+    root.idleSeconds = Model.idleSecondsAt(Date.now(), root.idleStart)
+    if (!root.armed) return
+
+    var due = Model.dueStages(root.idleSeconds, root.timers)
+    if (due.screenOff) turnScreenOff()
+    if (due.suspend) suspendSystem()
+  }
+
+  // Idle is hours away most of the time, so the quiet cadence is slow; once the
+  // seat is actually idle the poll tightens so a stage lands close to its mark
+  // and so activity cancels promptly.
+  readonly property int pollInterval: root.builtinIdle ? 5000 : 15000
+
+  onArmedChanged: if (!armed) endIdle("disarmed")
+
+  Timer {
+    id: pollTimer
+    interval: root.pollInterval
+    repeat: true
+    // Kept running even while disarmed so the screen is put back if a stage
+    // fired and then the timers were switched off underneath it.
+    running: true
+    triggeredOnStart: true
+    onTriggered: if (!idleProbe.running) idleProbe.running = true
+  }
+
+  Process {
+    id: idleProbe
+    running: false
+    command: Model.idleStatusArgv(root.omarchyPath)
+    // Parsed from onStreamFinished, not onExited: the process can report exit
+    // before the collector has the last of stdout, and a reading dropped that
+    // way is a poll silently skipped.
+    stdout: StdioCollector {
+      id: idleProbeOut
+      waitForEnd: true
+      onStreamFinished: root.applyIdleStatus(text)
+    }
+    onRunningChanged: if (running) probeWatchdog.restart()
+    onExited: function(exitCode) {
+      probeWatchdog.stop()
+      if (exitCode !== 0) root.builtinReachable = false
     }
   }
 
   Timer {
-    id: screenOffTimer
-    interval: Math.max(0, root.screenOffDelay) * 1000
+    // Every poll is skipped while the previous one is still running, so a probe
+    // that never exits would stop this service dead and it would stay stopped.
+    // Reap it well inside the poll interval so the next tick starts clean.
+    id: probeWatchdog
+    interval: 4000
     repeat: false
-    onTriggered: if (root.armed && root.inCycle) root.turnScreenOff()
-  }
-
-  Timer {
-    id: suspendTimer
-    interval: Math.max(0, root.suspendDelay) * 1000
-    repeat: false
-    onTriggered: if (root.armed && root.inCycle) root.suspendSystem()
+    onTriggered: if (idleProbe.running) idleProbe.running = false
   }
 
   Process { id: screenOffProcess }
@@ -185,25 +252,27 @@ Item {
     return JSON.stringify({
       armed: root.armed,
       stayAwake: root.stayAwake,
-      idle: idleMonitor.isIdle,
-      inCycle: root.inCycle,
-      screenIsOff: root.screenIsOff,
       timers: root.timers,
-      monitor: { enabled: idleMonitor.enabled, timeout: idleMonitor.timeout },
-      stages: {
-        screenOff: root.screenOffSeconds,
-        suspend: root.suspendSeconds,
-        firstStage: root.firstStageSeconds,
-        screenOffDelay: root.screenOffDelay,
-        suspendDelay: root.suspendDelay
+      builtin: {
+        reachable: root.builtinReachable,
+        idle: root.builtinIdle,
+        rawIdle: root.builtinRawIdle,
+        inCycle: root.builtinInCycle,
+        threshold: root.builtinThreshold
       },
-      pending: { screenOff: screenOffTimer.running, suspend: suspendTimer.running }
+      idleSeconds: root.idleSeconds,
+      screenIsOff: root.screenIsOff,
+      suspendFired: root.suspendFired,
+      pollInterval: root.pollInterval,
+      // Stages set shorter than the first-party threshold: they will run late,
+      // because nothing reports idle before that point.
+      lateStages: root.lateStages
     })
   }
 
   // Mirrors `omarchy-shell idle status`, which is the first thing to reach for
-  // when a stage does not fire: it answers whether the monitor is armed, what
-  // it is armed at, and which timers are pending, without guessing from logs.
+  // when a stage does not fire: it answers whether this service can see the
+  // first-party one, how long the seat has been idle, and what is pending.
   //
   // Safe as a plain IpcHandler because a service is a session singleton — a
   // bar widget would register one of these per monitor and lose the race.
@@ -214,6 +283,7 @@ Item {
     function refresh(): void {
       configFile.reload()
       stayAwakeProbeDebounce.restart()
+      if (!idleProbe.running) idleProbe.running = true
     }
 
     // Drives the real screen-off path and puts the display back a beat later.
@@ -234,7 +304,7 @@ Item {
   }
 
   Component.onCompleted: {
-    log("service-ready")
+    log("service-ready", "no IdleMonitor by design; reading omarchy.idle over IPC")
     stayAwakeProbeDebounce.restart()
   }
 }

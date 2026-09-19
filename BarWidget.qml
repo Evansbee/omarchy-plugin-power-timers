@@ -30,12 +30,33 @@ BarWidget {
 
   readonly property string summaryText: Model.summary(timers)
 
+  // True once a write has changed one of Omarchy's own two timeouts and the
+  // shell has not been restarted to pick it up yet.
+  property bool restartPending: false
+
   // ---- Writing. Everything funnels through omarchy-shell-config, Omarchy's
   //      own read-modify-write of shell.json, so this plugin never becomes a
   //      second writer racing the shell for that file.
   function writeTimers(next) {
     if (!bar) return
+    if (Model.needsShellRestart(root.timers, next)) root.restartPending = true
     bar.run(Model.writeCommand(next))
+  }
+
+  // Omarchy's idle service asks ext-idle-notify for its timeout once, when its
+  // monitor is built; changing idle.screensaver or idle.lock afterwards updates
+  // the QML property but never reaches the compositor. That is true with or
+  // without this plugin — a shell restart is what actually applies a new
+  // screensaver or lock timeout.
+  //
+  // Doing it when the panel closes rather than on every step keeps the panel
+  // usable while several stages are being set, and the restart is chained to a
+  // rewrite of the same values so it can never overtake the write it applies.
+  // This plugin's own two stages are timed in QML and need none of this.
+  function applyPending(latest) {
+    if (!root.restartPending || !bar) return
+    root.restartPending = false
+    bar.run(Model.writeCommand(latest || root.timers) + " && " + Model.restartShellCommand())
   }
 
   function toggleStayAwake() {

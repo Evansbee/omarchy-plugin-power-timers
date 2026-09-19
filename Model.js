@@ -189,6 +189,112 @@ function singleQuote(value) {
   return "'" + String(value === undefined || value === null ? "" : value).replace(/'/g, "'\\''") + "'"
 }
 
+// ------------------------------------------------- reading the idle service
+
+// This plugin deliberately creates no IdleMonitor of its own. Two of them in
+// one shell share a single ext-idle-notify registration, and the one that
+// registers first wins: a second monitor asking for a different timeout
+// silently pins the whole shell to the wrong one. When this plugin used its
+// own monitor set to two hours, Omarchy's screensaver and — far worse — its
+// auto-lock stopped firing at all.
+//
+// So idle is read from the first-party service instead, over the same IPC a
+// person would use. It reports whether the seat is idle and the two timeouts
+// it is watching; everything this plugin does is timed from there.
+// Invoked directly rather than through `bash -lc`: a login shell sources the
+// whole user profile on every poll, which is both slow and a way for an
+// unrelated shell change to break this. The path comes from the host, which
+// injects omarchyPath into every plugin entry point.
+function idleStatusArgv(omarchyPath) {
+  var base = String(omarchyPath || "/usr/share/omarchy").replace(/\/+$/, "")
+  return [base + "/bin/omarchy-shell", "idle", "status"]
+}
+
+// `idle` alone is the wrong signal to time from. Launching the screensaver
+// makes the compositor report activity, so the first-party monitor's isIdle
+// drops back to false for a moment every time the screensaver appears — and
+// timing from that restarts this plugin's clock on every screensaver, pushing
+// a two-hour stage out by however long the screensaver took to arrive.
+//
+// The first-party service already solves this for itself and exposes the
+// result: `inIdleCycle` stays true across that blip and only clears on real
+// activity. Either one being true means the seat has been quiet since the
+// cycle began.
+function parseIdleStatus(raw) {
+  var out = { ok: false, idle: false, rawIdle: false, inCycle: false,
+              screensaver: 0, lock: 0, threshold: 0 }
+  try {
+    var data = JSON.parse(String(raw || ""))
+    if (!data || typeof data !== "object") return out
+    out.ok = true
+    out.rawIdle = data.idle === true
+    out.inCycle = data.inIdleCycle === true
+    out.idle = out.rawIdle || out.inCycle
+    out.screensaver = seconds(data.screensaver)
+    out.lock = seconds(data.lock)
+    var candidates = []
+    if (out.screensaver > 0) candidates.push(out.screensaver)
+    if (out.lock > 0) candidates.push(out.lock)
+    out.threshold = candidates.length ? Math.min.apply(null, candidates) : 0
+    return out
+  } catch (e) {
+    return out
+  }
+}
+
+// The first-party monitor only reports idle once it passes min(screensaver,
+// lock), so that moment is `threshold` seconds after the seat actually went
+// quiet. Idle therefore began `threshold` seconds before it was observed.
+function idleStartFrom(observedAtMs, threshold) {
+  return Number(observedAtMs) - Math.max(0, seconds(threshold)) * 1000
+}
+
+function idleSecondsAt(nowMs, idleStartMs) {
+  if (!idleStartMs) return 0
+  return Math.max(0, Math.floor((Number(nowMs) - Number(idleStartMs)) / 1000))
+}
+
+// Which of this plugin's stages are due for a given idle duration.
+function dueStages(idleSeconds, timers) {
+  return {
+    screenOff: seconds(timers.screenOff) > 0 && idleSeconds >= seconds(timers.screenOff),
+    suspend: seconds(timers.suspend) > 0 && idleSeconds >= seconds(timers.suspend)
+  }
+}
+
+// A stage set earlier than the first-party threshold cannot fire on time,
+// because nothing reports idle before then. Worth surfacing rather than
+// quietly running late.
+function stagesBelowThreshold(timers, threshold) {
+  var limit = seconds(threshold)
+  var late = []
+  if (limit <= 0) return late
+  if (seconds(timers.screenOff) > 0 && seconds(timers.screenOff) < limit) late.push("screenOff")
+  if (seconds(timers.suspend) > 0 && seconds(timers.suspend) < limit) late.push("suspend")
+  return late
+}
+
+// ----------------------------------------------------- applying the changes
+
+// Changing `idle.screensaver` or `idle.lock` updates the first-party service's
+// QML properties but NOT its Wayland registration — ext-idle-notify is asked
+// for a timeout once, when the monitor is built, and a later change to the
+// property never reaches the compositor. Omarchy has this behaviour with or
+// without this plugin installed; restarting the shell is what actually applies
+// a new screensaver or lock timeout.
+//
+// This plugin's own two stages are timed in QML off the observed idle state,
+// so they take effect immediately and need none of this.
+function needsShellRestart(before, after) {
+  if (!before || !after) return false
+  return seconds(before.screensaver) !== seconds(after.screensaver)
+    || seconds(before.lock) !== seconds(after.lock)
+}
+
+function restartShellCommand() {
+  return "omarchy restart shell"
+}
+
 // -------------------------------------------------------------- the service
 
 // Hyprland 0.56 takes Lua dispatchers, so the old `hyprctl dispatch dpms off`
