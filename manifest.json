@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "evansbee.power-timers",
+  "name": "Power timers",
+  "version": "1.0.0",
+  "author": "evansbee",
+  "license": "MIT",
+  "description": "Set the screensaver, lock, screen-off, and sleep timeouts from the bar",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Power timers",
+    "description": "Set the screensaver, lock, screen-off, and sleep timeouts from the bar",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
