@@ -207,7 +207,14 @@ function singleQuote(value) {
 // injects omarchyPath into every plugin entry point.
 function idleStatusArgv(omarchyPath) {
   var base = String(omarchyPath || "/usr/share/omarchy").replace(/\/+$/, "")
-  return [base + "/bin/omarchy-shell", "idle", "status"]
+  var cli = base + "/bin/omarchy-shell"
+  // Both facts in one spawn: whether the seat is idle, and whether the session
+  // is locked. The lock matters because locking *ends* the first-party idle
+  // cycle — see the note on `locked` in parseIdleStatus.
+  return ["bash", "-c",
+    'i=$("' + cli + '" idle status 2>/dev/null); '
+    + 'l=$("' + cli + '" lock isLocked 2>/dev/null); '
+    + 'printf \'{"idle":%s,"locked":"%s"}\' "${i:-null}" "${l:-false}"']
 }
 
 // `idle` alone is the wrong signal to time from. Launching the screensaver
@@ -220,16 +227,39 @@ function idleStatusArgv(omarchyPath) {
 // result: `inIdleCycle` stays true across that blip and only clears on real
 // activity. Either one being true means the seat has been quiet since the
 // cycle began.
+// `locked` is the third signal, and it is not optional. Locking the session
+// *ends* the first-party idle cycle: omarchy.idle sets idledThisCycle = false
+// in lockSystem(), and mapping the lock surface reports activity, so both
+// `idle` and `inIdleCycle` go false at the moment the lock appears. Measured
+// on a real overnight idle: the clock reset at the 30-minute lock and the
+// two-hour screen-off landed at two hours *after the lock* instead of after
+// the seat went quiet.
+//
+// A locked session has by definition not been touched since it locked, so
+// `locked` keeps the clock running. It deliberately does not let a stage
+// *fire*, though — see mayFire — or the display would blank under someone
+// typing their password.
 function parseIdleStatus(raw) {
-  var out = { ok: false, idle: false, rawIdle: false, inCycle: false,
-              screensaver: 0, lock: 0, threshold: 0 }
+  var out = { ok: false, idle: false, rawIdle: false, inCycle: false, locked: false,
+              mayFire: false, screensaver: 0, lock: 0, threshold: 0 }
   try {
-    var data = JSON.parse(String(raw || ""))
-    if (!data || typeof data !== "object") return out
+    var wrapper = JSON.parse(String(raw || ""))
+    if (!wrapper || typeof wrapper !== "object") return out
+    out.locked = String(wrapper.locked) === "true"
+
+    var data = wrapper.idle
+    if (!data || typeof data !== "object") {
+      // The idle service did not answer. A known lock is still worth acting
+      // on: it means the seat is untouched, so the clock keeps running.
+      out.ok = out.locked
+      out.idle = out.locked
+      return out
+    }
     out.ok = true
     out.rawIdle = data.idle === true
     out.inCycle = data.inIdleCycle === true
-    out.idle = out.rawIdle || out.inCycle
+    out.mayFire = out.rawIdle || out.inCycle
+    out.idle = out.mayFire || out.locked
     out.screensaver = seconds(data.screensaver)
     out.lock = seconds(data.lock)
     var candidates = []

@@ -51,6 +51,8 @@ Item {
   property bool builtinIdle: false
   property bool builtinRawIdle: false
   property bool builtinInCycle: false
+  property bool builtinLocked: false
+  property bool builtinMayFire: false
   property int builtinThreshold: 0
   property bool builtinReachable: false
 
@@ -130,7 +132,9 @@ Item {
     root.builtinIdle = status.idle
     root.builtinRawIdle = status.rawIdle
     root.builtinInCycle = status.inCycle
-    root.builtinThreshold = status.threshold
+    root.builtinLocked = status.locked
+    root.builtinMayFire = status.mayFire
+    if (status.threshold > 0) root.builtinThreshold = status.threshold
 
     if (!status.idle) {
       endIdle("activity")
@@ -145,6 +149,11 @@ Item {
 
     root.idleSeconds = Model.idleSecondsAt(Date.now(), root.idleStart)
     if (!root.armed) return
+
+    // A locked session keeps the clock running but must not blank the display
+    // under someone typing their password, so firing needs the compositor (or
+    // the first-party cycle) to agree the seat is actually idle.
+    if (!status.mayFire) return
 
     var due = Model.dueStages(root.idleSeconds, root.timers)
     if (due.screenOff) turnScreenOff()
@@ -258,6 +267,8 @@ Item {
         idle: root.builtinIdle,
         rawIdle: root.builtinRawIdle,
         inCycle: root.builtinInCycle,
+        locked: root.builtinLocked,
+        mayFire: root.builtinMayFire,
         threshold: root.builtinThreshold
       },
       idleSeconds: root.idleSeconds,
